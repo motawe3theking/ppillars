@@ -10,6 +10,7 @@ from pointpillars.utils import setup_seed, read_points, read_calib, read_label, 
     vis_img_3d, bbox3d2corners_camera, points_camera2image, \
     bbox_camera2lidar
 from pointpillars.model import PointPillars
+NARROW_RANGE = True # Whether to use narrow point cloud range for evaluation
 
 
 def point_range_filter(pts, point_range=[0, -39.68, -3, 69.12, 39.68, 1]):
@@ -35,21 +36,41 @@ def main(args):
         'Car': 2
         }
     LABEL2CLASSES = {v:k for k, v in CLASSES.items()}
-    pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 0.0], dtype=np.float32)
+    if NARROW_RANGE:
+       point_cloud_range = [0, -10.24, -3, 69.12, 10.24, 1]
+       pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
+    else:
+       pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 0.0], dtype=np.float32)
+    
 
     if not args.no_cuda:
         model = PointPillars(nclasses=len(CLASSES)).cuda()
-        model.load_state_dict(torch.load(args.ckpt))
+        checkpoint = torch.load(args.ckpt)
     else:
         model = PointPillars(nclasses=len(CLASSES))
-        model.load_state_dict(
-            torch.load(args.ckpt, map_location=torch.device('cpu')))
+        checkpoint = torch.load(args.ckpt, map_location=torch.device('cpu'))
+    
+    # Handle both old-style (just model state_dict) and new-style (full checkpoint) formats
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+    else:
+        model.load_state_dict(checkpoint)
+        print("Loaded legacy checkpoint format")
     
     if not os.path.exists(args.pc_path):
-        raise FileNotFoundError 
+        raise FileNotFoundError(f"Point cloud file not found: {args.pc_path}")
+    
     pc_all = read_points(args.pc_path)
-    pc = read_points(args.pc_path)
-    pc = point_range_filter(pc)
+    print(f"Initial point cloud size: {pc_all.shape}")
+    if pc_all.shape[0] == 0:
+        raise ValueError(f"Empty point cloud loaded from {args.pc_path}. Please check if the file is corrupted or empty.")
+    
+    pc = point_range_filter(pc_all)
+    print(f"Point cloud size after filtering: {pc.shape}")
+    if pc.shape[0] == 0:
+        raise ValueError(f"No points remained after range filtering. Check if point_range filter is too restrictive or if points are outside the expected range.")
+    
     pc_torch = torch.from_numpy(pc)
     if os.path.exists(args.calib_path):
         calib_info = read_calib(args.calib_path)
@@ -66,13 +87,70 @@ def main(args):
     else:
         img = None
 
+    # Optional model summary
+    if getattr(args, 'summary', False):
+        # Provide a tiny dry-run if possible
+        dry_pts = torch.from_numpy(pc[:min(len(pc), 4096)])
+        if not args.no_cuda:
+            dry_pts = dry_pts.cuda()
+        try:
+            print(model.summary(batched_pts=[dry_pts], verbose=True))
+        except Exception as e:
+            print(f"Model summary (without dry-run) due to error: {e}")
+            print(model.summary(batched_pts=None, verbose=True))
+
     model.eval()
     with torch.no_grad():
-        if not args.no_cuda:
-            pc_torch = pc_torch.cuda()
-        
-        result_filter = model(batched_pts=[pc_torch], 
-                              mode='test')[0]
+        try:
+            if not args.no_cuda:
+                pc_torch = pc_torch.cuda()
+                print(f"Point cloud shape: {pc_torch.shape}, dtype: {pc_torch.dtype}, device: {pc_torch.device}")
+            
+            # Ensure the point cloud has correct dimensions
+            if len(pc_torch.shape) != 2 or pc_torch.shape[1] != 4:
+                raise ValueError(f"Expected point cloud shape (N, 4), got {pc_torch.shape}")
+            
+            # Perform warm-up inferences
+            print("Performing warm-up inferences...")
+            num_warmup = 5
+            for i in range(num_warmup):
+                _ = model(batched_pts=[pc_torch], mode='test')[0]
+                if not args.no_cuda:
+                    torch.cuda.synchronize()
+                print(f"Warm-up inference {i+1}/{num_warmup} completed")
+            
+            print("\nStarting timed inference...")
+            
+            # Enable CUDA error debugging and timing
+            if not args.no_cuda:
+                torch.cuda.synchronize()
+                start_time = torch.cuda.Event(enable_timing=True)
+                end_time = torch.cuda.Event(enable_timing=True)
+                start_time.record()
+            else:
+                start_time = torch.time.time()
+            
+            result_filter = model(batched_pts=[pc_torch], mode='test')[0]
+            
+            if not args.no_cuda:
+                end_time.record()
+                torch.cuda.synchronize()
+                inference_time = start_time.elapsed_time(end_time) / 1000  # Convert to seconds
+            else:
+                inference_time = torch.time.time() - start_time
+            
+            print(f"\nInference time: {inference_time:.3f} seconds ({1/inference_time:.1f} FPS)")
+            if not args.no_cuda:
+                torch.cuda.synchronize()
+        except Exception as e:
+            print(f"\nError details:")
+            print(f"Point cloud statistics:")
+            print(f"- Shape: {pc_torch.shape}")
+            print(f"- Device: {pc_torch.device}")
+            print(f"- Has NaN: {torch.isnan(pc_torch).any()}")
+            print(f"- Has Inf: {torch.isinf(pc_torch).any()}")
+            print(f"- Value range: [{pc_torch.min().item()}, {pc_torch.max().item()}]")
+            raise e
     if calib_info is not None and img is not None:
         tr_velo_to_cam = calib_info['Tr_velo_to_cam'].astype(np.float32)
         r0_rect = calib_info['R0_rect'].astype(np.float32)
@@ -134,6 +212,8 @@ if __name__ == '__main__':
     parser.add_argument('--img_path', default='', help='your image path')
     parser.add_argument('--no_cuda', action='store_true',
                         help='whether to use cuda')
+    parser.add_argument('--summary', action='store_true',
+                        help='print model summary and exit')
     args = parser.parse_args()
 
     main(args)

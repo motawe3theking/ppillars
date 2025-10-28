@@ -11,6 +11,8 @@ from pointpillars.utils import setup_seed, keep_bbox_from_image_range, \
 from pointpillars.dataset import Kitti, get_dataloader
 from pointpillars.model import PointPillars
 
+NARROW_RANGE = False # Whether to use narrow point cloud range for evaluation
+
 
 def get_score_thresholds(tp_scores, total_num_valid_gt, num_sample_pts=41):
     score_thresholds = []
@@ -33,11 +35,12 @@ def get_score_thresholds(tp_scores, total_num_valid_gt, num_sample_pts=41):
     return score_thresholds
 
 
-def do_eval(det_results, gt_results, CLASSES, saved_path):
+def do_eval(det_results, gt_results, CLASSES, saved_path, pcd_limit_range=None):
     '''
     det_results: list,
     gt_results: dict(id -> det_results)
     CLASSES: dict
+    pcd_limit_range: optional filter for ground truth boxes (numpy array [x_min, y_min, z_min, x_max, y_max, z_max])
     '''
     assert len(det_results) == len(gt_results)
     f = open(os.path.join(saved_path, 'eval_results.txt'), 'w')
@@ -52,6 +55,53 @@ def do_eval(det_results, gt_results, CLASSES, saved_path):
     for id in ids:
         gt_result = gt_results[id]['annos']
         det_result = det_results[id]
+        
+        # Filter ground truth to point cloud range if specified
+        if pcd_limit_range is not None:
+            # Convert camera coordinates to lidar for filtering
+            gt_location = gt_result['location'].astype(np.float32)
+            gt_dimensions = gt_result['dimensions'].astype(np.float32)
+            gt_rotation_y = gt_result['rotation_y'].astype(np.float32)
+            
+            # Get calibration to convert to lidar coords
+            calib = gt_results[id]['calib']
+            
+            # Handle both numpy arrays and tensors
+            if isinstance(calib['Tr_velo_to_cam'], torch.Tensor):
+                tr_velo_to_cam = calib['Tr_velo_to_cam'].cpu().numpy().astype(np.float32)
+                r0_rect = calib['R0_rect'].cpu().numpy().astype(np.float32)
+            else:
+                tr_velo_to_cam = calib['Tr_velo_to_cam'].astype(np.float32)
+                r0_rect = calib['R0_rect'].astype(np.float32)
+            
+            # Convert camera boxes to lidar
+            from pointpillars.utils import bbox_camera2lidar
+            if len(gt_location) > 0:
+                gt_bboxes_camera = np.concatenate([gt_location, gt_dimensions, gt_rotation_y[:, None]], axis=-1)
+                gt_bboxes_lidar = bbox_camera2lidar(gt_bboxes_camera, tr_velo_to_cam, r0_rect)
+                
+                # Filter by lidar range (check center point is within range)
+                mask = (
+                    (gt_bboxes_lidar[:, 0] >= pcd_limit_range[0]) &
+                    (gt_bboxes_lidar[:, 0] <= pcd_limit_range[3]) &
+                    (gt_bboxes_lidar[:, 1] >= pcd_limit_range[1]) &
+                    (gt_bboxes_lidar[:, 1] <= pcd_limit_range[4]) &
+                    (gt_bboxes_lidar[:, 2] >= pcd_limit_range[2]) &
+                    (gt_bboxes_lidar[:, 2] <= pcd_limit_range[5])
+                )
+                
+                # Apply mask to all ground truth fields
+                gt_result = {
+                    'name': gt_result['name'][mask],
+                    'truncated': gt_result['truncated'][mask],
+                    'occluded': gt_result['occluded'][mask],
+                    'alpha': gt_result['alpha'][mask],
+                    'bbox': gt_result['bbox'][mask],
+                    'dimensions': gt_result['dimensions'][mask],
+                    'location': gt_result['location'][mask],
+                    'rotation_y': gt_result['rotation_y'][mask],
+                    'difficulty': gt_result['difficulty'][mask] if 'difficulty' in gt_result else np.zeros(mask.sum(), dtype=np.int32)
+                }
 
         # 1.1, 2d bboxes iou
         gt_bboxes2d = gt_result['bbox'].astype(np.float32)
@@ -67,14 +117,31 @@ def do_eval(det_results, gt_results, CLASSES, saved_path):
         det_dimensions = det_result['dimensions'].astype(np.float32)
         det_rotation_y = det_result['rotation_y'].astype(np.float32)
 
-        gt_bev = np.concatenate([gt_location[:, [0, 2]], gt_dimensions[:, [0, 2]], gt_rotation_y[:, None]], axis=-1)
-        det_bev = np.concatenate([det_location[:, [0, 2]], det_dimensions[:, [0, 2]], det_rotation_y[:, None]], axis=-1)
+        # Handle empty arrays - ensure they remain 2D
+        if len(gt_rotation_y) == 0:
+            gt_bev = np.zeros((0, 5), dtype=np.float32)
+        else:
+            gt_bev = np.concatenate([gt_location[:, [0, 2]], gt_dimensions[:, [0, 2]], gt_rotation_y[:, None]], axis=-1)
+        
+        if len(det_rotation_y) == 0:
+            det_bev = np.zeros((0, 5), dtype=np.float32)
+        else:
+            det_bev = np.concatenate([det_location[:, [0, 2]], det_dimensions[:, [0, 2]], det_rotation_y[:, None]], axis=-1)
+        
         iou_bev_v = iou_bev(torch.from_numpy(gt_bev).cuda(), torch.from_numpy(det_bev).cuda())
         ious['bbox_bev'].append(iou_bev_v.cpu().numpy())
 
         # 1.3, 3dbboxes iou
-        gt_bboxes3d = np.concatenate([gt_location, gt_dimensions, gt_rotation_y[:, None]], axis=-1)
-        det_bboxes3d = np.concatenate([det_location, det_dimensions, det_rotation_y[:, None]], axis=-1)
+        if len(gt_rotation_y) == 0:
+            gt_bboxes3d = np.zeros((0, 7), dtype=np.float32)
+        else:
+            gt_bboxes3d = np.concatenate([gt_location, gt_dimensions, gt_rotation_y[:, None]], axis=-1)
+        
+        if len(det_rotation_y) == 0:
+            det_bboxes3d = np.zeros((0, 7), dtype=np.float32)
+        else:
+            det_bboxes3d = np.concatenate([det_location, det_dimensions, det_rotation_y[:, None]], axis=-1)
+        
         iou3d_v = iou3d_camera(torch.from_numpy(gt_bboxes3d).cuda(), torch.from_numpy(det_bboxes3d).cuda())
         ious['bbox_3d'].append(iou3d_v.cpu().numpy())
 
@@ -131,7 +198,13 @@ def do_eval(det_results, gt_results, CLASSES, saved_path):
 
                     # 1.2 det bbox property
                     cur_det_names = det_result['name']
-                    cur_det_heights = det_result['bbox'][:, 3] - det_result['bbox'][:, 1]
+                    # Handle empty detection bbox arrays
+                    det_bbox = det_result['bbox']
+                    if len(det_bbox) == 0:
+                        cur_det_heights = np.array([], dtype=np.float32)
+                    else:
+                        cur_det_heights = det_bbox[:, 3] - det_bbox[:, 1]
+                    
                     det_ignores = []
                     for j, cur_det_name in enumerate(cur_det_names):
                         if cur_det_heights[j] < MIN_HEIGHT[difficulty]:
@@ -288,18 +361,46 @@ def main(args):
 
     if not args.no_cuda:
         model = PointPillars(nclasses=args.nclasses).cuda()
-        model.load_state_dict(torch.load(args.ckpt))
+        checkpoint = torch.load(args.ckpt)
+        # Handle both old and new checkpoint formats
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Try strict loading first, fall back to non-strict if incompatible
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as e:
+            print(f"Warning: Strict loading failed. Loading with strict=False...")
+            print(f"Error: {e}")
+            model.load_state_dict(state_dict, strict=False)
     else:
         model = PointPillars(nclasses=args.nclasses)
-        model.load_state_dict(
-            torch.load(args.ckpt, map_location=torch.device('cpu')))
+        checkpoint = torch.load(args.ckpt, map_location=torch.device('cpu'))
+        # Handle both old and new checkpoint formats
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Try strict loading first, fall back to non-strict if incompatible
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as e:
+            print(f"Warning: Strict loading failed. Loading with strict=False...")
+            print(f"Error: {e}")
+            model.load_state_dict(state_dict, strict=False)
     
     saved_path = args.saved_path
     os.makedirs(saved_path, exist_ok=True)
     saved_submit_path = os.path.join(saved_path, 'submit')
     os.makedirs(saved_submit_path, exist_ok=True)
-
-    pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 0.0], dtype=np.float32)
+    if NARROW_RANGE:
+       point_cloud_range = [0, -10.24, -3, 69.12, 10.24, 1]
+       pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
+    else:
+       pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 0.0], dtype=np.float32)
 
     model.eval()
     with torch.no_grad():
@@ -367,16 +468,17 @@ def main(args):
         write_pickle(format_results, os.path.join(saved_path, 'results.pkl'))
     
     print('Evaluating.. Please wait several seconds.')
-    do_eval(format_results, val_dataset.data_infos, CLASSES, saved_path)
+    print(f'Using point cloud range filter: {pcd_limit_range.tolist()}')
+    do_eval(format_results, val_dataset.data_infos, CLASSES, saved_path, pcd_limit_range=pcd_limit_range)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Configuration Parameters')
-    parser.add_argument('--data_root', default='/mnt/ssd1/lifa_rdata/det/kitti', 
+    parser.add_argument('--data_root', default='pointpillars\dataset\kitti\kitti', 
                         help='your data root for kitti')
     parser.add_argument('--ckpt', default='pretrained/epoch_160.pth', help='your checkpoint for kitti')
     parser.add_argument('--saved_path', default='results', help='your saved path for predicted results')
-    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=5)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--nclasses', type=int, default=3)
     parser.add_argument('--no_cuda', action='store_true',

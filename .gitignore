@@ -7,3 +7,26 @@ tmp/
 results/
 *.sh
 .idea
+
+# Dataset directories
+pointpillars/dataset/kitti/kitti/
+pointpillars/dataset/kitti/
+pointpillars/dataset/demo_data/
+**/kitti/training/
+**/kitti/testing/
+*.bin
+*.png
+*.jpg
+*.jpeg
+
+# Checkpoints and logs (optional - remove if you want to push them)
+32feat/
+OG_NarrowTuned/
+pillar_logs/
+pillar_logs_fusion/
+pretrained/
+*.pth
+flops_summary.txt
+
+# Trained models
+pointpillars/trained_models/

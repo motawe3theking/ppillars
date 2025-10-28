@@ -429,6 +429,10 @@ def iou2d(bboxes1, bboxes2, metric=0):
     bboxes2: (m, 4), (x1, y1, x2, y2)
     return: (n, m)
     '''
+    # Handle empty tensors
+    if bboxes1.shape[0] == 0 or bboxes2.shape[0] == 0:
+        return torch.zeros((bboxes1.shape[0], bboxes2.shape[0]), dtype=bboxes1.dtype, device=bboxes1.device)
+    
     bboxes_x1 = torch.maximum(bboxes1[:, 0][:, None], bboxes2[:, 0][None, :]) # (n, m)
     bboxes_y1 = torch.maximum(bboxes1[:, 1][:, None], bboxes2[:, 1][None, :]) # (n, m)
     bboxes_x2 = torch.minimum(bboxes1[:, 2][:, None], bboxes2[:, 2][None, :])
@@ -502,6 +506,10 @@ def iou3d_camera(bboxes1, bboxes2):
     bboxes2: (m, 7)
     return: (n, m)
     '''
+    # Handle empty tensors
+    if bboxes1.shape[0] == 0 or bboxes2.shape[0] == 0:
+        return torch.zeros((bboxes1.shape[0], bboxes2.shape[0]), dtype=bboxes1.dtype, device=bboxes1.device)
+    
     # 1. height overlap
     bboxes1_bottom, bboxes2_bottom = bboxes1[:, 1] - bboxes1[:, 4], bboxes2[:, 1] -  bboxes2[:, 4] # (n, ), (m, )
     bboxes1_top, bboxes2_top = bboxes1[:, 1], bboxes2[:, 1] # (n, ), (m, )
@@ -536,6 +544,10 @@ def iou_bev(bboxes1, bboxes2):
     bboxes2: (m, 5)
     return: (n, m)
     '''
+    # Handle empty tensors
+    if bboxes1.shape[0] == 0 or bboxes2.shape[0] == 0:
+        return torch.zeros((bboxes1.shape[0], bboxes2.shape[0]), dtype=bboxes1.dtype, device=bboxes1.device)
+    
     bboxes1_x1y1 = bboxes1[:, :2] - bboxes1[:, 2:4] / 2
     bboxes1_x2y2 = bboxes1[:, :2] + bboxes1[:, 2:4] / 2
     bboxes2_x1y1 = bboxes2[:, :2] - bboxes2[:, 2:4] / 2

@@ -20,6 +20,7 @@ setup(
             sources=[
                 'pointpillars/ops/iou3d/iou3d.cpp',
                 'pointpillars/ops/iou3d/iou3d_kernel.cu',
+                
             ],
             define_macros=[('WITH_CUDA', None)]
         )
