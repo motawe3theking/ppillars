@@ -94,7 +94,7 @@ def points_camera2lidar(points, tr_velo_to_cam, r0_rect):
 
 
 def bbox3d2bevcorners(bboxes):
-    '''
+    r'''
     bboxes: shape=(n, 7)
 
                 ^ x (-0.5 * pi)
