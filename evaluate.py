@@ -10,8 +10,7 @@ from pointpillars.utils import setup_seed, keep_bbox_from_image_range, \
     iou2d, iou3d_camera, iou_bev
 from pointpillars.dataset import Kitti, get_dataloader
 from pointpillars.model import PointPillars
-
-NARROW_RANGE = False # Whether to use narrow point cloud range for evaluation
+from pointpillars.model.pointpillars import NARROW_RANGE
 
 
 def get_score_thresholds(tp_scores, total_num_valid_gt, num_sample_pts=41):
@@ -35,15 +34,28 @@ def get_score_thresholds(tp_scores, total_num_valid_gt, num_sample_pts=41):
     return score_thresholds
 
 
-def do_eval(det_results, gt_results, CLASSES, saved_path, pcd_limit_range=None):
+def do_eval(det_results, gt_results, CLASSES, saved_path, pcd_limit_range=None, range_name='default'):
     '''
     det_results: list,
     gt_results: dict(id -> det_results)
     CLASSES: dict
     pcd_limit_range: optional filter for ground truth boxes (numpy array [x_min, y_min, z_min, x_max, y_max, z_max])
+    range_name: name of the range configuration for reporting (e.g., 'wide', 'mid', 'small')
     '''
     assert len(det_results) == len(gt_results)
-    f = open(os.path.join(saved_path, 'eval_results.txt'), 'w')
+    
+    # Calculate range area for normalization
+    if pcd_limit_range is not None:
+        range_x = pcd_limit_range[3] - pcd_limit_range[0]
+        range_y = pcd_limit_range[4] - pcd_limit_range[1]
+        range_area = range_x * range_y
+        print(f"\nEvaluating with {range_name} range: {pcd_limit_range.tolist()}")
+        print(f"Range coverage: X={range_x:.2f}m, Y={range_y:.2f}m, Area={range_area:.2f}m²")
+    else:
+        range_area = None
+        range_name = 'no_filter'
+    
+    f = open(os.path.join(saved_path, f'eval_results_{range_name}.txt'), 'w')
 
     # 1. calculate iou
     ious = {
@@ -152,10 +164,20 @@ def do_eval(det_results, gt_results, CLASSES, saved_path, pcd_limit_range=None):
     }
     MIN_HEIGHT = [40, 25, 25]
 
+    # Initialize confusion matrix for each evaluation type
+    # Format: confusion_matrix[gt_class][pred_class] = count
+    # Special indices: 0=Pedestrian, 1=Cyclist, 2=Car, 3=Missed (FN), 4=FP
+    CLASS_NAMES = ['Pedestrian', 'Cyclist', 'Car']
+    confusion_matrices = {}
+
     overall_results = {}
     for e_ind, eval_type in enumerate(['bbox_2d', 'bbox_bev', 'bbox_3d']):
         eval_ious = ious[eval_type]
         eval_ap_results, eval_aos_results = {}, {}
+        
+        # Initialize confusion matrix for this evaluation type (3x5: GT classes vs Pred classes+Missed+FP)
+        confusion_matrix = np.zeros((3, 5), dtype=np.int32)  # [Ped, Cyc, Car] x [Ped, Cyc, Car, Missed, FP]
+        
         for cls in CLASSES:
             eval_ap_results[cls] = []
             eval_aos_results[cls] = []
@@ -239,6 +261,12 @@ def do_eval(det_results, gt_results, CLASSES, saved_path, pcd_limit_range=None):
                             if det_ignores[match_id] == 0 and gt_ignores[j] == 0:
                                 tp_scores.append(match_score)
                 total_num_valid_gt = np.sum([np.sum(np.array(gt_ignores) == 0) for gt_ignores in total_gt_ignores])
+                
+                # Store GT count for range-aware reporting
+                if difficulty == 0:  # Only count once per class
+                    if eval_type == 'bbox_3d':  # Use 3D for reference
+                        eval_ap_results[f'{cls}_gt_count'] = total_num_valid_gt
+                
                 score_thresholds = get_score_thresholds(tp_scores, total_num_valid_gt)    
             
                 # 3. draw PR curve and calculate mAP
@@ -324,12 +352,108 @@ def do_eval(det_results, gt_results, CLASSES, saved_path, pcd_limit_range=None):
                         sums_similarity += similarity[i]
                     mSimilarity = sums_similarity / 11 * 100
                     eval_aos_results[cls].append(mSimilarity)
+        
+        # Build confusion matrix for moderate difficulty at 0.5 score threshold
+        # Use first score threshold point for confusion matrix
+        for cls_idx, cls in enumerate(CLASSES):
+            CLS_MIN_IOU = MIN_IOUS[cls][e_ind]
+            difficulty = 0  # Moderate
+            score_threshold = 0.1  # Common threshold
+            
+            for i, id in enumerate(ids):
+                cur_eval_ious = ious[eval_type][i]
+                gt_result = gt_results[id]['annos']
+                det_result = det_results[id]
+                
+                cur_gt_names = gt_result['name']
+                cur_difficulty = gt_result['difficulty']
+                gt_ignores = []
+                for j, cur_gt_name in enumerate(cur_gt_names):
+                    ignore = cur_difficulty[j] < 0 or cur_difficulty[j] > difficulty
+                    if cur_gt_name == cls:
+                        valid_class = 1
+                    elif cls == 'Pedestrian' and cur_gt_name == 'Person_sitting':
+                        valid_class = 0
+                    elif cls == 'Car' and cur_gt_name == 'Van':
+                        valid_class = 0
+                    else:
+                        valid_class = -1
+                    
+                    if valid_class == 1 and not ignore:
+                        gt_ignores.append(0)
+                    elif valid_class == 0 or (valid_class == 1 and ignore):
+                        gt_ignores.append(1)
+                    elif valid_class == -1:
+                        gt_ignores.append(-1)
+                
+                det_names = det_result['name']
+                det_scores = det_result['score']  # Note: 'score' not 'scores'
+                det_ignores = []
+                for det_name in det_names:
+                    if det_name == cls:
+                        det_ignores.append(0)
+                    else:
+                        det_ignores.append(-1)
+                
+                # Match detections to ground truth
+                nn, mm = cur_eval_ious.shape
+                assigned = np.zeros((mm,), dtype=np.bool_)
+                
+                for j in range(nn):
+                    if gt_ignores[j] != 0:  # Only process valid GT of this class
+                        continue
+                    
+                    match_id = -1
+                    match_iou = -1
+                    for k in range(mm):
+                        if not assigned[k] and det_ignores[k] == 0 and det_scores[k] >= score_threshold:
+                            if cur_eval_ious[j, k] > CLS_MIN_IOU and cur_eval_ious[j, k] > match_iou:
+                                match_iou = cur_eval_ious[j, k]
+                                match_id = k
+                    
+                    if match_id != -1:
+                        # True Positive: GT matched correctly
+                        assigned[match_id] = True
+                        confusion_matrix[cls_idx, cls_idx] += 1
+                    else:
+                        # False Negative: GT not detected (Missed column)
+                        confusion_matrix[cls_idx, 3] += 1
+                
+                # Count false positives (unmatched detections of this class)
+                for k in range(mm):
+                    if det_ignores[k] == 0 and det_scores[k] >= score_threshold and not assigned[k]:
+                        # False positive for this class
+                        confusion_matrix[cls_idx, 4] += 1
+        
+        confusion_matrices[eval_type] = confusion_matrix
 
-        print(f'=========={eval_type.upper()}==========')
-        print(f'=========={eval_type.upper()}==========', file=f)
+        print(f'=========={eval_type.upper()} ({range_name.upper()})==========')
+        print(f'=========={eval_type.upper()} ({range_name.upper()})==========', file=f)
+        
+        # Print range info and GT statistics
+        if pcd_limit_range is not None and eval_type == 'bbox_3d':
+            print(f'Range: X=[{pcd_limit_range[0]:.2f}, {pcd_limit_range[3]:.2f}], Y=[{pcd_limit_range[1]:.2f}, {pcd_limit_range[4]:.2f}], Z=[{pcd_limit_range[2]:.2f}, {pcd_limit_range[5]:.2f}]')
+            print(f'Range: X=[{pcd_limit_range[0]:.2f}, {pcd_limit_range[3]:.2f}], Y=[{pcd_limit_range[1]:.2f}, {pcd_limit_range[4]:.2f}], Z=[{pcd_limit_range[2]:.2f}, {pcd_limit_range[5]:.2f}]', file=f)
+            print(f'Range area: {range_area:.2f} m²')
+            print(f'Range area: {range_area:.2f} m²', file=f)
+            
+            # Print ground truth counts per class
+            print(f'\nGround Truth Object Counts (Easy difficulty):')
+            print(f'\nGround Truth Object Counts (Easy difficulty):', file=f)
+            for cls in CLASSES:
+                gt_key = f'{cls}_gt_count'
+                if gt_key in eval_ap_results:
+                    gt_count = eval_ap_results[gt_key]
+                    gt_density = gt_count / range_area if range_area and range_area > 0 else 0
+                    print(f'  {cls}: {gt_count} objects ({gt_density:.4f} objs/m²)')
+                    print(f'  {cls}: {gt_count} objects ({gt_density:.4f} objs/m²)', file=f)
+            print()
+            print(file=f)
+        
         for k, v in eval_ap_results.items():
-            print(f'{k} AP@{MIN_IOUS[k][e_ind]}: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}')
-            print(f'{k} AP@{MIN_IOUS[k][e_ind]}: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}', file=f)
+            if not k.endswith('_gt_count'):  # Skip GT count entries
+                print(f'{k} AP@{MIN_IOUS[k][e_ind]}: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}')
+                print(f'{k} AP@{MIN_IOUS[k][e_ind]}: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}', file=f)
         if eval_type == 'bbox_2d':
             print(f'==========AOS==========')
             print(f'==========AOS==========', file=f)
@@ -337,7 +461,35 @@ def do_eval(det_results, gt_results, CLASSES, saved_path, pcd_limit_range=None):
                 print(f'{k} AOS@{MIN_IOUS[k][e_ind]}: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}')
                 print(f'{k} AOS@{MIN_IOUS[k][e_ind]}: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}', file=f)
         
-        overall_results[eval_type] = np.mean(list(eval_ap_results.values()), 0)
+        # Print confusion matrix for this evaluation type
+        print(f'\n==========CONFUSION MATRIX ({eval_type.upper()}, Moderate, Score>=0.5)==========')
+        print(f'\n==========CONFUSION MATRIX ({eval_type.upper()}, Moderate, Score>=0.5)==========', file=f)
+        cm = confusion_matrices[eval_type]
+        
+        # Header
+        header = "GT\\Pred".ljust(12)
+        for cls_name in CLASS_NAMES:
+            header += cls_name[:3].ljust(8)
+        header += "Missed".ljust(8)
+        header += "FP".ljust(8)
+        print(header)
+        print(header, file=f)
+        print("-" * len(header))
+        print("-" * len(header), file=f)
+        
+        # Rows
+        for i, gt_cls in enumerate(CLASS_NAMES):
+            row = gt_cls[:12].ljust(12)
+            for j in range(5):
+                row += str(cm[i, j]).ljust(8)
+            print(row)
+            print(row, file=f)
+        print()
+        print(file=f)
+        
+        # Filter out GT count entries before calculating overall mean
+        ap_values_only = {k: v for k, v in eval_ap_results.items() if not k.endswith('_gt_count')}
+        overall_results[eval_type] = np.mean(list(ap_values_only.values()), 0)
         if eval_type == 'bbox_2d':
             overall_results['AOS'] = np.mean(list(eval_aos_results.values()), 0)
     
@@ -396,11 +548,32 @@ def main(args):
     os.makedirs(saved_path, exist_ok=True)
     saved_submit_path = os.path.join(saved_path, 'submit')
     os.makedirs(saved_submit_path, exist_ok=True)
-    if NARROW_RANGE:
-       point_cloud_range = [0, -10.24, -3, 69.12, 10.24, 1]
-       pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
+    # Define all point cloud ranges
+    RANGES = {
+        'wide': np.array([0, -39.68, -3, 69.12, 39.68, 1], dtype=np.float32),
+        'mid': np.array([0, -20.48, -3, 40.96, 20.48, 1], dtype=np.float32),
+        'small': np.array([0, -10.24, -3, 69.12, 10.24, 1], dtype=np.float32),
+    }
+    
+    # Get model's configured range
+    if NARROW_RANGE == 'small':
+        model_range_name = 'small'
+        pcd_limit_range = RANGES['small']
+    elif NARROW_RANGE == 'mid':
+        model_range_name = 'mid'
+        pcd_limit_range = RANGES['mid']
+    elif NARROW_RANGE == 'wide':
+        model_range_name = 'wide'
+        pcd_limit_range = RANGES['wide']
     else:
-       pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 0.0], dtype=np.float32)
+        # Default to wide range
+        model_range_name = 'wide'
+        pcd_limit_range = RANGES['wide']
+    
+    print(f'\n{"="*60}')
+    print(f'Model Configuration: {model_range_name.upper()} range')
+    print(f'Point Cloud Range: {pcd_limit_range.tolist()}')
+    print(f'{"="*60}\n')
 
     model.eval()
     with torch.no_grad():
@@ -467,9 +640,35 @@ def main(args):
         
         write_pickle(format_results, os.path.join(saved_path, 'results.pkl'))
     
-    print('Evaluating.. Please wait several seconds.')
-    print(f'Using point cloud range filter: {pcd_limit_range.tolist()}')
-    do_eval(format_results, val_dataset.data_infos, CLASSES, saved_path, pcd_limit_range=pcd_limit_range)
+    print('\n' + '='*60)
+    print('EVALUATION RESULTS')
+    print('='*60)
+    
+    # Evaluate on model's configured range
+    print(f'\n{"="*60}')
+    print(f'PRIMARY EVALUATION: {model_range_name.upper()} Range (Model Configuration)')
+    print(f'{"="*60}')
+    do_eval(format_results, val_dataset.data_infos, CLASSES, saved_path, 
+            pcd_limit_range=pcd_limit_range, range_name=model_range_name)
+    
+    # Optionally evaluate on all ranges for comparison
+    if args.eval_all_ranges:
+        print(f'\n{"="*60}')
+        print(f'COMPARATIVE EVALUATION: All Ranges')
+        print(f'{"="*60}')
+        
+        for range_name, range_limits in RANGES.items():
+            if range_name != model_range_name:  # Skip model's range (already done)
+                print(f'\n{"-"*60}')
+                print(f'Evaluating on {range_name.upper()} range for comparison')
+                print(f'{"-"*60}')
+                do_eval(format_results, val_dataset.data_infos, CLASSES, saved_path,
+                       pcd_limit_range=range_limits, range_name=range_name)
+    
+    print(f'\n{"="*60}')
+    print('Evaluation complete!')
+    print(f'Results saved to: {saved_path}')
+    print(f'{"="*60}\n')
 
 
 if __name__ == '__main__':
@@ -478,11 +677,13 @@ if __name__ == '__main__':
                         help='your data root for kitti')
     parser.add_argument('--ckpt', default='pretrained/epoch_160.pth', help='your checkpoint for kitti')
     parser.add_argument('--saved_path', default='results', help='your saved path for predicted results')
-    parser.add_argument('--batch_size', type=int, default=5)
+    parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--nclasses', type=int, default=3)
     parser.add_argument('--no_cuda', action='store_true',
                         help='whether to use cuda')
+    parser.add_argument('--eval_all_ranges', action='store_true',
+                        help='evaluate on all ranges (wide, mid, small) for comparison')
     args = parser.parse_args()
 
     main(args)

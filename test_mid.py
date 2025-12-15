@@ -10,7 +10,7 @@ from pointpillars.utils import setup_seed, read_points, read_calib, read_label, 
     vis_img_3d, bbox3d2corners_camera, points_camera2image, \
     bbox_camera2lidar
 from pointpillars.model import PointPillars
-NARROW_RANGE = True # Whether to use narrow point cloud range for evaluation
+NARROW_RANGE = 'small' # Whether to use narrow point cloud range for evaluation
 
 
 def point_range_filter(pts, point_range=[0, -39.68, -3, 69.12, 39.68, 1]):
@@ -36,12 +36,16 @@ def main(args):
         'Car': 2
         }
     LABEL2CLASSES = {v:k for k, v in CLASSES.items()}
-    if NARROW_RANGE:
-       point_cloud_range = [0, -10.24, -3, 69.12, 10.24, 1]
-       pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
-    else:
-       pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 0.0], dtype=np.float32)
     
+    if NARROW_RANGE == 'small':
+        point_cloud_range = [0, -10.24, -3, 69.12, 10.24, 1]
+        pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
+    elif NARROW_RANGE == 'mid':
+        point_cloud_range = [0, -20.48, -3, 40.96, 20.48, 1]
+        pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
+    elif NARROW_RANGE == 'wide':
+        point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1]
+        pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
 
     if not args.no_cuda:
         model = PointPillars(nclasses=len(CLASSES)).cuda()
@@ -57,6 +61,10 @@ def main(args):
     else:
         model.load_state_dict(checkpoint)
         print("Loaded legacy checkpoint format")
+    
+    # Fuse BatchNorm into Conv for 10-20% speedup (no retraining needed!)
+    if not args.no_fuse:
+        model.fuse_bn()
     
     if not os.path.exists(args.pc_path):
         raise FileNotFoundError(f"Point cloud file not found: {args.pc_path}")
@@ -167,9 +175,12 @@ def main(args):
 
     if calib_info is not None and img is not None:
         bboxes2d, camera_bboxes = result_filter['bboxes2d'], result_filter['camera_bboxes'] 
+        point_heights = result_filter.get('point_heights', None)  # Get point-level heights if available
+        print(f"[TEST_MID DEBUG] point_heights: {point_heights[:3] if point_heights is not None and len(point_heights) > 3 else point_heights}")
+        print(f"[TEST_MID DEBUG] camera_bboxes shape: {camera_bboxes.shape}")
         bboxes_corners = bbox3d2corners_camera(camera_bboxes)
         image_points = points_camera2image(bboxes_corners, P2)
-        img = vis_img_3d(img, image_points, labels, rt=True)
+        img = vis_img_3d(img, image_points, labels, camera_bboxes=camera_bboxes, point_heights=point_heights, rt=True)
 
     if calib_info is not None and gt_label is not None:
         tr_velo_to_cam = calib_info['Tr_velo_to_cam'].astype(np.float32)
@@ -196,7 +207,7 @@ def main(args):
             bboxes_corners = bbox3d2corners_camera(bboxes_camera)
             image_points = points_camera2image(bboxes_corners, P2)
             gt_labels = [-1] * len(gt_label['name'])
-            img = vis_img_3d(img, image_points, gt_labels, rt=True)
+            img = vis_img_3d(img, image_points, gt_labels, camera_bboxes=bboxes_camera, rt=True)
     
     if calib_info is not None and img is not None:
         cv2.imshow(f'{os.path.basename(args.img_path)}-3d bbox', img)
@@ -212,6 +223,8 @@ if __name__ == '__main__':
     parser.add_argument('--img_path', default='', help='your image path')
     parser.add_argument('--no_cuda', action='store_true',
                         help='whether to use cuda')
+    parser.add_argument('--no_fuse', action='store_true',
+                        help='disable BatchNorm fusion (slower but keeps original layers)')
     parser.add_argument('--summary', action='store_true',
                         help='print model summary and exit')
     args = parser.parse_args()
