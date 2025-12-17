@@ -1,0 +1,37 @@
+BENCHMARK RESULTS (WIDE Range)
+============================================================
+Checkpoint: C:\Users\AIT\Desktop\GIU\Bachelor\manual_repo_migrate\PointPillars\mobilenet_Ratio_0.16m_64f_Upsample\checkpoints\checkpoint_epoch_103.pth
+Data root: C:\Users\AIT\Desktop\GIU\Bachelor\manual_repo_migrate\PointPillars\pointpillars\dataset\kitti\kitti
+Warm-up samples: 5
+Test samples: 50
+Score threshold: 0.1
+NMS IoU threshold: 0.01
+Random seed: 42
+============================================================
+
+Point Cloud Range Configuration:
+  Range: WIDE
+  Dimensions: X=[0.00, 69.12], Y=[-39.68, 39.68], Z=[-3.00, 1.00]
+  Coverage: X=69.12m, Y=79.36m, Area=5485.36m²
+
+Ground Truth Statistics:
+  Total objects (all): 209
+  Total objects (in range): 205 (98.1% of all)
+  Object density: 0.0374 objs/m²
+
+  Per-class counts (in range):
+    Pedestrian: 32 objects (0.0058 objs/m²)
+    Cyclist: 6 objects (0.0011 objs/m²)
+    Car: 167 objects (0.0304 objs/m²)
+
+Inference Time Statistics:
+  Average: 58.57 ms
+  Std Dev: 9.25 ms
+  Min: 44.26 ms
+  Max: 78.25 ms
+  Throughput: 17.07 samples/sec
+
+Classification Metrics (averaged over 50 samples with GT):
+  Average Precision: 0.4588
+  Average Recall: 0.9936
+  Average F1 Score: 0.5831

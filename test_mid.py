@@ -10,7 +10,7 @@ from pointpillars.utils import setup_seed, read_points, read_calib, read_label, 
     vis_img_3d, bbox3d2corners_camera, points_camera2image, \
     bbox_camera2lidar
 from pointpillars.model import PointPillars
-NARROW_RANGE = 'small' # Whether to use narrow point cloud range for evaluation
+NARROW_RANGE = 'wide' # Whether to use narrow point cloud range for evaluation
 
 
 def point_range_filter(pts, point_range=[0, -39.68, -3, 69.12, 39.68, 1]):
@@ -44,7 +44,8 @@ def main(args):
         point_cloud_range = [0, -20.48, -3, 40.96, 20.48, 1]
         pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
     elif NARROW_RANGE == 'wide':
-        point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1]
+        # point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1]
+        point_cloud_range = [0, -40.32, -3, 70.2, 40.32, 1]
         pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
 
     if not args.no_cuda:

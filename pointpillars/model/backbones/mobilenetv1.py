@@ -27,23 +27,23 @@ class MobileNetV1(nn.Module):
         # Modified architecture: 32 -> 32 -> 64 -> 128
         # Stage 1: 32 input -> 32 output (stride 2, then 2x stride 1)
         self.stage1 = nn.Sequential(
-            conv_dw(in_channels, 32, 2),  # 32 -> 32, stride 2
-            conv_dw(32, 32, 1),            # 32 -> 32, stride 1
-            conv_dw(32, 32, 1)             # 32 -> 32, stride 1
+            conv_dw(in_channels, 64, 2),  # 32 -> 64, stride 2
+            conv_dw(64, 64, 1),            # 64 -> 64, stride 1
+            conv_dw(64, 64, 1)             # 64 -> 64, stride 1
         )
         # Stage 2: 32 -> 64 (stride 2, then stride 1)
         self.stage2 = nn.Sequential(
-            conv_dw(32, 64, 2),   # 32 -> 64, stride 2
-            conv_dw(64, 64, 1)    # 64 -> 64, stride 1
+            conv_dw(64, 128, 2),   # 64 -> 128, stride 2
+            conv_dw(128, 128, 1)    # 128 -> 128, stride 1
         )
         # Stage 3: 64 -> 128 (stride 2, then multiple stride 1)
         self.stage3 = nn.Sequential(
-            conv_dw(64, 128, 2),   # 64 -> 128, stride 2
-            conv_dw(128, 128, 1),  # 128 -> 128, stride 1
-            conv_dw(128, 128, 1),  # 128 -> 128, stride 1
-            conv_dw(128, 128, 1),  # 128 -> 128, stride 1
-            conv_dw(128, 128, 1),  # 128 -> 128, stride 1
-            conv_dw(128, 128, 1)   # 128 -> 128, stride 1
+            conv_dw(128, 256, 2),   # 64 -> 128, stride 2
+            conv_dw(256, 256, 1),  # 128 -> 128, stride 1
+            conv_dw(256, 256, 1),  # 128 -> 128, stride 1
+            conv_dw(256, 256, 1),  # 128 -> 128, stride 1
+            conv_dw(256, 256, 1),  # 128 -> 128, stride 1
+            conv_dw(256, 256, 1)   # 128 -> 128, stride 1
         )
 
         # Initialize weights

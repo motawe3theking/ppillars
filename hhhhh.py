@@ -14,24 +14,19 @@ import os
 # Enable CUDA error debugging
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-BACKBONE_SELECT = 'mobilenet'   # Options: 'default', 'mobilenet'
-BACKBONE_CONV_TYPE = 'standard'  # Options: 'standard', 'depthwise_separable' (only for 'default' backbone)
-ENCODER = 'HCF'                 # Options: 'default', 'HCF'
+BACKBONE_SELECT = 'default'   # Options: 'default', 'mobilenet'
+ENCODER = 'default'                 # Options: 'default', 'HCF'
 NARROW_RANGE = 'wide'            # Whether to use narrow point cloud range [wide: 496*432, mid:256*256, small]
-ENABLE_TIMING = True           # Timing measurement switch
+ENABLE_TIMING = False           # Timing measurement switch
 USE_HARD_VOXELIZATION = False   # Voxelization method switch: False=default, True=hard_pillar
 PILLAR_FEATURES = 64           # Number of pillar features after encoding
-UPSAMPLE = True                 # Whether to use ConvTranspose2d for upsampling in the decoder (Neck)
-NECK_CONV_TYPE = 'depthwise_separable'     # Options: 'standard', 'depthwise_separable' (for Neck upsample convs when UPSAMPLE=True)
+UPSAMPLE = False                 # Whether to use ConvTranspose2d for upsampling in the decoder (Neck)
 MERGE_BACKBONE_NECK = False      # True: Use merged RPN-style architecture (like SECOND, faster!), False: Separate Backbone+Neck
-ENABLE_POST_FILTER = False       # Post-processing filter to reject tree-like false positives for pedestrian class
 
 # Performance optimizations applied:
 # 1. Direct attribute access (block1/block2/block3 instead of ModuleList iteration)
 # 2. BatchNorm fusion via model.fuse_bn() - call after loading checkpoint
 # 3. Merged Backbone+Neck when MERGE_BACKBONE_NECK=True - eliminates function call overhead
-# 4. Depthwise-separable convolutions when BACKBONE_CONV_TYPE='depthwise_separable' - ~8x FLOP reduction
-# 5. Depthwise-separable convolutions in Neck when NECK_CONV_TYPE='depthwise_separable' - additional FLOP savings
 
 
 class FLOPsCounter:
@@ -40,29 +35,17 @@ class FLOPsCounter:
     @staticmethod
     def count_conv2d(module, input_shape, output_shape):
         """
-        Calculate FLOPs for Conv2d layer (supports grouped convolutions).
-        For standard conv: FLOPs = 2 * Cin * Kh * Kw * Cout * Hout * Wout
-        For grouped conv:  FLOPs = 2 * (Cin/groups) * Kh * Kw * Cout * Hout * Wout
-        For depthwise (groups=Cin): FLOPs = 2 * Kh * Kw * Cout * Hout * Wout
+        Calculate FLOPs for Conv2d layer.
+        FLOPs = 2 * Cin * Kh * Kw * Cout * Hout * Wout
         (multiply-add counted as 2 ops)
         """
         batch, cin, hin, win = input_shape
         bout, cout, hout, wout = output_shape
-        
-        # Account for grouped convolutions (e.g., depthwise: groups=in_channels)
-        groups = module.groups if hasattr(module, 'groups') else 1
-        
-        # For grouped convolutions, each group processes Cin/groups input channels
-        cin_per_group = cin // groups
-        kernel_ops = module.kernel_size[0] * module.kernel_size[1] * cin_per_group
+        kernel_ops = module.kernel_size[0] * module.kernel_size[1] * cin
         output_size = hout * wout
-        
-        # FLOPs = 2 (for MAC) * kernel_ops * output_channels * spatial_size * batch
-        flops = 2 * kernel_ops * cout * output_size * batch
-        
+        flops = kernel_ops * cout * output_size * batch
         if module.bias is not None:
             flops += cout * output_size * batch
-        
         return flops
     
     @staticmethod
@@ -408,8 +391,8 @@ if ENCODER == 'default':
 elif ENCODER == 'HCF':
     class PillarEncoder(nn.Module):
         """
-        GPU-optimized Pillar Feature Encoder implementing paper equations (4) with additional height-to-area ratio
-        Transforms tensor (P, N, 4) to (P, N, 10) with HCF, then to (P, 64) via PW conv + pooling
+        GPU-optimized Pillar Feature Encoder implementing paper equations (4)
+        Transforms tensor (P, N, 4) to (P, N, 9) with HCF, then to (P, 64) via PW conv + pooling
         """
         def __init__(self, voxel_size, point_cloud_range, in_channel, out_channel):
             super().__init__()
@@ -421,12 +404,12 @@ elif ENCODER == 'HCF':
             self.y_l = int((point_cloud_range[4] - point_cloud_range[1]) / voxel_size[1])
 
             # Point-wise (PW) convolution as specified in paper
-            self.conv = nn.Conv1d(10, out_channel, 1, bias=False)  # 10 features after HCF (added height-to-area ratio)
+            self.conv = nn.Conv1d(9, out_channel, 1, bias=False)  # 9 features after HCF
             self.bn = nn.BatchNorm1d(out_channel, eps=1e-3, momentum=0.01)
 
         def forward(self, pillars, coors_batch, npoints_per_pillar):
             '''
-            GPU-optimized forward implementing paper equation (4): ni=[x,y,z,r,xm,ym,zm,xc,yc,height_to_area_ratio]
+            GPU-optimized forward implementing paper equation (4): ni=[x,y,z,r,xm,ym,zm,xc,yc]
             
             Input:
             - pillars: (P, N, 4) - tensor from equation (3): ni=[x,y,z,r]  
@@ -477,7 +460,7 @@ elif ENCODER == 'HCF':
         def _compute_hcf_vectorized(self, pillars, coors_batch, npoints_per_pillar):
             """
             GPU-vectorized HCF computation implementing equation (4)
-            ni=[x,y,z,r,xm,ym,zm,xc,yc,height_to_area_ratio]
+            ni=[x,y,z,r,xm,ym,zm,xc,yc]
             """
             P, N = pillars.shape[:2]
             device = pillars.device
@@ -502,60 +485,16 @@ elif ENCODER == 'HCF':
             center_diffs_x = xyz[:, :, 0:1] - pillar_centers_x.unsqueeze(1)  # (P, N, 1)
             center_diffs_y = xyz[:, :, 1:2] - pillar_centers_y.unsqueeze(1)  # (P, N, 1)
             
-            # Compute height-to-area ratio for each pillar
-            # Extract x, y, z coordinates
-            x_coords = xyz[:, :, 0]  # (P, N)
-            y_coords = xyz[:, :, 1]  # (P, N)
-            z_coords = xyz[:, :, 2]  # (P, N)
-            
-            # Create mask for valid points (non-zero z values)
-            valid_mask = (z_coords != 0).float()  # (P, N)
-            
-            # Replace padding zeros with the mean of valid points (already calculated in point_means)
-            # This avoids distorting percentiles while maintaining GPU vectorization
-            z_masked = torch.where(valid_mask.bool(), z_coords, point_means[:, :, 2].expand_as(z_coords))
-            x_masked = torch.where(valid_mask.bool(), x_coords, point_means[:, :, 0].expand_as(x_coords))
-            y_masked = torch.where(valid_mask.bool(), y_coords, point_means[:, :, 1].expand_as(y_coords))
-            
-            # Robust height calculation using percentiles (95th - 5th percentile)
-            z_95 = torch.quantile(z_masked, 0.95, dim=1, keepdim=True)  # (P, 1)
-            z_5 = torch.quantile(z_masked, 0.05, dim=1, keepdim=True)   # (P, 1)
-            pillar_heights = torch.clamp(z_95 - z_5, min=1e-6)  # (P, 1)
-            
-            # Robust width and length calculation using percentiles
-            x_95 = torch.quantile(x_masked, 0.95, dim=1, keepdim=True)  # (P, 1)
-            x_5 = torch.quantile(x_masked, 0.05, dim=1, keepdim=True)   # (P, 1)
-            pillar_widths = torch.clamp(x_95 - x_5, min=1e-6)  # (P, 1)
-            
-            y_95 = torch.quantile(y_masked, 0.95, dim=1, keepdim=True)  # (P, 1)
-            y_5 = torch.quantile(y_masked, 0.05, dim=1, keepdim=True)   # (P, 1)
-            pillar_lengths = torch.clamp(y_95 - y_5, min=1e-6)  # (P, 1)
-            
-            # Compute area and avoid division by zero
-            pillar_areas = torch.clamp(pillar_widths * pillar_lengths, min=1e-6)  # (P, 1)
-            
-            # Calculate height-to-area ratio
-            height_to_area_ratios = pillar_heights / pillar_areas  # (P, 1)
-            
-            # Normalize the ratio (z-score normalization)
-            ratio_mean = height_to_area_ratios.mean()
-            ratio_std = height_to_area_ratios.std()
-            height_to_area_ratios = (height_to_area_ratios - ratio_mean) / (ratio_std + 1e-6)
-            
-            # Expand to match point dimension: (P, 1) -> (P, N, 1)
-            height_to_area_ratios = height_to_area_ratios.unsqueeze(1).expand(-1, N, -1)
-            
-            # Concatenate all features: [x,y,z,r,xm,ym,zm,xc,yc,height_to_area_ratio] - extended equation (4)
+            # Concatenate all features: [x,y,z,r,xm,ym,zm,xc,yc] - equation (4)
             features_with_hcf = torch.cat([
-                xyz[:, :, 0:1],         # x coordinate (1)
-                xyz[:, :, 1:2],         # y coordinate (1)
-                xyz[:, :, 2:3],         # z coordinate (1)
-                reflectivity,           # r (reflectivity) (1)
-                mean_diffs,             # xm, ym, zm differences (3)
-                center_diffs_x,         # xc difference (1)
-                center_diffs_y,         # yc difference (1)
-                height_to_area_ratios   # height-to-area ratio (1)
-            ], dim=-1)  # (P, N, 10)
+                xyz[:, :, 0:1],  # x coordinate (1)
+                xyz[:, :, 1:2],  # y coordinate (1)
+                xyz[:, :, 2:3],  # z coordinate (1)
+                reflectivity,    # r (reflectivity) (1)
+                mean_diffs,      # xm, ym, zm differences (3)
+                center_diffs_x,  # xc difference (1)
+                center_diffs_y   # yc difference (1)
+            ], dim=-1)  # (P, N, 9)
             
             return features_with_hcf
         
@@ -573,12 +512,12 @@ elif ENCODER == 'HCF':
         
         def _pointwise_convolution(self, features_with_hcf):
             """
-            Point-wise convolution as specified in paper: (P, N, 10) -> (P, N, 64)
+            Point-wise convolution as specified in paper: (P, N, 9) -> (P, N, 64)
             """
             P, N, _ = features_with_hcf.shape
             
-            # Reshape for Conv1d: (P, 10, N)
-            features_transposed = features_with_hcf.transpose(1, 2)  # (P, 10, N)
+            # Reshape for Conv1d: (P, 9, N)
+            features_transposed = features_with_hcf.transpose(1, 2)  # (P, 9, N)
             
             # Point-wise convolution + BatchNorm + ReLU
             features_conv = self.conv(features_transposed)  # (P, 64, N)
@@ -624,47 +563,7 @@ elif ENCODER == 'HCF':
             
             return feature_maps
 
-
-class DepthwiseSeparableConv(nn.Module):
-    """
-    Depthwise-separable convolution: Depthwise conv + Pointwise conv
-    Reduces FLOPs by ~8-9× compared to standard convolution for 3×3 kernels
-    """
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False):
-        super().__init__()
-        # Depthwise convolution: each input channel is convolved separately
-        self.depthwise = nn.Conv2d(
-            in_channels, 
-            in_channels, 
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            groups=in_channels,  # Key: groups=in_channels for depthwise
-            bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(in_channels, eps=1e-3, momentum=0.01)
-        
-        # Pointwise convolution: 1×1 conv to mix channels
-        self.pointwise = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=bias
-        )
-        self.bn2 = nn.BatchNorm2d(out_channels, eps=1e-3, momentum=0.01)
-        self.relu = nn.ReLU(inplace=True)
-    
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.pointwise(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        return x
-
+   
 
 class Backbone(nn.Module):
     def __init__(self, in_channel, out_channels, layer_nums, layer_strides=[2, 2, 2]):
@@ -720,41 +619,24 @@ class Neck(nn.Module):
             decoder_block = []
             # Use Upsample + Conv2d instead of ConvTranspose2d
             if UPSAMPLE:
-                if NECK_CONV_TYPE == 'depthwise_separable':
-                    # Depthwise-separable conv already includes BN + ReLU
-                    decoder_block.append(
-                        nn.Sequential(
-                            nn.Upsample(scale_factor=upsample_strides[i], mode='nearest'),
-                            DepthwiseSeparableConv(in_channels[i], 
-                                                  out_channels[i], 
-                                                  kernel_size=3,
-                                                  stride=1,
-                                                  padding=1,
-                                                  bias=False)
-                        )
+                decoder_block.append(
+                    nn.Sequential(
+                        nn.Upsample(scale_factor=upsample_strides[i], mode='nearest'),
+                        nn.Conv2d(in_channels[i], 
+                                out_channels[i], 
+                                kernel_size=3,
+                                padding=1,
+                                bias=False)
                     )
-                else:
-                    # Standard convolution
-                    decoder_block.append(
-                        nn.Sequential(
-                            nn.Upsample(scale_factor=upsample_strides[i], mode='nearest'),
-                            nn.Conv2d(in_channels[i], 
-                                    out_channels[i], 
-                                    kernel_size=3,
-                                    padding=1,
-                                    bias=False)
-                        )
-                    )
-                    decoder_block.append(nn.BatchNorm2d(out_channels[i], eps=1e-3, momentum=0.01))
-                    decoder_block.append(nn.ReLU(inplace=True))
+                )
             else:
                 decoder_block.append(nn.ConvTranspose2d(in_channels[i], 
                                                     out_channels[i], 
                                                     upsample_strides[i], 
                                                     stride=upsample_strides[i],
                                                     bias=False))
-                decoder_block.append(nn.BatchNorm2d(out_channels[i], eps=1e-3, momentum=0.01))
-                decoder_block.append(nn.ReLU(inplace=True))
+            decoder_block.append(nn.BatchNorm2d(out_channels[i], eps=1e-3, momentum=0.01))
+            decoder_block.append(nn.ReLU(inplace=True))
 
             setattr(self, f'decoder{i+1}', nn.Sequential(*decoder_block))
         
@@ -827,19 +709,13 @@ class BackboneNeck(nn.Module):
         decoder1_layers = []
         if UPSAMPLE:
             decoder1_layers.append(nn.Upsample(scale_factor=neck_upsample_strides[0], mode='nearest'))
-            if NECK_CONV_TYPE == 'depthwise_separable':
-                decoder1_layers.append(DepthwiseSeparableConv(backbone_out_channels[0], neck_out_channels[0], 
-                                                              kernel_size=3, stride=1, padding=1, bias=False))
-            else:
-                decoder1_layers.append(nn.Conv2d(backbone_out_channels[0], neck_out_channels[0], 
-                                                kernel_size=3, padding=1, bias=False))
-                decoder1_layers.append(nn.BatchNorm2d(neck_out_channels[0], eps=1e-3, momentum=0.01))
-                decoder1_layers.append(nn.ReLU(inplace=True))
+            decoder1_layers.append(nn.Conv2d(backbone_out_channels[0], neck_out_channels[0], 
+                                            kernel_size=3, padding=1, bias=False))
         else:
             decoder1_layers.append(nn.ConvTranspose2d(backbone_out_channels[0], neck_out_channels[0],
                                                      neck_upsample_strides[0], stride=neck_upsample_strides[0], bias=False))
-            decoder1_layers.append(nn.BatchNorm2d(neck_out_channels[0], eps=1e-3, momentum=0.01))
-            decoder1_layers.append(nn.ReLU(inplace=True))
+        decoder1_layers.append(nn.BatchNorm2d(neck_out_channels[0], eps=1e-3, momentum=0.01))
+        decoder1_layers.append(nn.ReLU(inplace=True))
         self.decoder1 = nn.Sequential(*decoder1_layers)
         
         # Build block2 (backbone stage 2)
@@ -858,19 +734,13 @@ class BackboneNeck(nn.Module):
         decoder2_layers = []
         if UPSAMPLE:
             decoder2_layers.append(nn.Upsample(scale_factor=neck_upsample_strides[1], mode='nearest'))
-            if NECK_CONV_TYPE == 'depthwise_separable':
-                decoder2_layers.append(DepthwiseSeparableConv(backbone_out_channels[1], neck_out_channels[1],
-                                                              kernel_size=3, stride=1, padding=1, bias=False))
-            else:
-                decoder2_layers.append(nn.Conv2d(backbone_out_channels[1], neck_out_channels[1],
-                                                kernel_size=3, padding=1, bias=False))
-                decoder2_layers.append(nn.BatchNorm2d(neck_out_channels[1], eps=1e-3, momentum=0.01))
-                decoder2_layers.append(nn.ReLU(inplace=True))
+            decoder2_layers.append(nn.Conv2d(backbone_out_channels[1], neck_out_channels[1],
+                                            kernel_size=3, padding=1, bias=False))
         else:
             decoder2_layers.append(nn.ConvTranspose2d(backbone_out_channels[1], neck_out_channels[1],
                                                      neck_upsample_strides[1], stride=neck_upsample_strides[1], bias=False))
-            decoder2_layers.append(nn.BatchNorm2d(neck_out_channels[1], eps=1e-3, momentum=0.01))
-            decoder2_layers.append(nn.ReLU(inplace=True))
+        decoder2_layers.append(nn.BatchNorm2d(neck_out_channels[1], eps=1e-3, momentum=0.01))
+        decoder2_layers.append(nn.ReLU(inplace=True))
         self.decoder2 = nn.Sequential(*decoder2_layers)
         
         # Build block3 (backbone stage 3)
@@ -889,19 +759,13 @@ class BackboneNeck(nn.Module):
         decoder3_layers = []
         if UPSAMPLE:
             decoder3_layers.append(nn.Upsample(scale_factor=neck_upsample_strides[2], mode='nearest'))
-            if NECK_CONV_TYPE == 'depthwise_separable':
-                decoder3_layers.append(DepthwiseSeparableConv(backbone_out_channels[2], neck_out_channels[2],
-                                                              kernel_size=3, stride=1, padding=1, bias=False))
-            else:
-                decoder3_layers.append(nn.Conv2d(backbone_out_channels[2], neck_out_channels[2],
-                                                kernel_size=3, padding=1, bias=False))
-                decoder3_layers.append(nn.BatchNorm2d(neck_out_channels[2], eps=1e-3, momentum=0.01))
-                decoder3_layers.append(nn.ReLU(inplace=True))
+            decoder3_layers.append(nn.Conv2d(backbone_out_channels[2], neck_out_channels[2],
+                                            kernel_size=3, padding=1, bias=False))
         else:
             decoder3_layers.append(nn.ConvTranspose2d(backbone_out_channels[2], neck_out_channels[2],
                                                      neck_upsample_strides[2], stride=neck_upsample_strides[2], bias=False))
-            decoder3_layers.append(nn.BatchNorm2d(neck_out_channels[2], eps=1e-3, momentum=0.01))
-            decoder3_layers.append(nn.ReLU(inplace=True))
+        decoder3_layers.append(nn.BatchNorm2d(neck_out_channels[2], eps=1e-3, momentum=0.01))
+        decoder3_layers.append(nn.ReLU(inplace=True))
         self.decoder3 = nn.Sequential(*decoder3_layers)
         
         # Initialize weights
@@ -992,18 +856,14 @@ class PointPillars(nn.Module):
         point_cloud_range = [0, -20.48, -3, 40.96, 20.48, 1]
         pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
     elif NARROW_RANGE == 'wide':
-        # point_cloud_range = [0, -40.32, -3, 70.2, 40.32, 1]
-        point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1]
+        point_cloud_range = [0, -40.32, -3, 69.44, 40.32, 1]
         pcd_limit_range = np.array(point_cloud_range, dtype=np.float32)
     def __init__(self,
                  nclasses=3, 
-                #  voxel_size=[0.28, 0.28, 4],
-                voxel_size=[0.16, 0.16, 4],
+                 voxel_size=[0.28, 0.28, 4],
                  point_cloud_range=point_cloud_range,
-                #  max_num_points=100,
-                max_num_points=32,
-                #  max_voxels=(8000, 8000),
-                max_voxels=(16000, 40000),
+                 max_num_points=100,
+                 max_voxels=(8000, 8000),
                  backbone_type=BACKBONE_SELECT):
         super().__init__()
         self.nclasses = nclasses
@@ -1095,11 +955,9 @@ class PointPillars(nn.Module):
                 [0, -20.48, -1.78, 40.96, 20.48, -1.78]
             ]
         elif NARROW_RANGE == 'wide':
-            ranges = [[0, -40.32, -0.6, 70.2, 40.32, -0.6],
-                    [0, -40.32, -0.6, 70.2, 40.32, -0.6],
-                    # [0, -40.32, -1.78, 70.2, 40.32, -1.78]
-                    [0, -39.68, -3, 69.12, 39.68, 1]
-                    ]
+            ranges = [[0, -40.32, -0.6, 69.44, 40.32, -0.6],
+                    [0, -40.32, -0.6, 69.44, 40.32, -0.6],
+                    [0, -40.32, -1.78, 69.44, 40.32, -1.78]]
         # KITTI anchor sizes: [width, length, height] in LiDAR coordinates
         # Order must match class indices: Car=0, Pedestrian=1, Cyclist=2
         sizes = [[0.6, 0.8, 1.73], [0.6, 1.76, 1.73], [1.6, 3.9, 1.56]] # Cyclist: w=0.6m, l=1.76m, h=1.73m
@@ -1342,13 +1200,12 @@ class PointPillars(nn.Module):
             print(text)
         return text
 
-    def get_predicted_bboxes_single(self, bbox_cls_pred, bbox_pred, bbox_dir_cls_pred, anchors, points=None):
+    def get_predicted_bboxes_single(self, bbox_cls_pred, bbox_pred, bbox_dir_cls_pred, anchors):
         '''
         bbox_cls_pred: (n_anchors*3, 248, 216) 
         bbox_pred: (n_anchors*7, 248, 216)
         bbox_dir_cls_pred: (n_anchors*2, 248, 216)
         anchors: (y_l, x_l, 3, 2, 7)
-        points: (M, 4) [x, y, z, intensity] or None - original point cloud for post-filtering
         return: 
             bboxes: (k, 7)
             labels: (k, )
@@ -1428,198 +1285,21 @@ class PointPillars(nn.Module):
             ret_bboxes = ret_bboxes[final_inds]
             ret_labels = ret_labels[final_inds]
             ret_scores = ret_scores[final_inds]
-        
-        # Use bbox predicted heights (more accurate than sparse point cloud)
-        # Point cloud is too sparse to reliably measure pedestrian height
-        bbox_heights = ret_bboxes[:, 5].detach().cpu().numpy() if ret_bboxes.size(0) > 0 else None
-        
-        # Post-processing filter to reject tree-like false positives
-        if ENABLE_POST_FILTER and ret_bboxes.size(0) > 0:
-            ret_bboxes, ret_labels, ret_scores, bbox_heights = self._apply_post_filter(
-                ret_bboxes, ret_labels, ret_scores, points, bbox_heights
-            )
             
         result = {
             'lidar_bboxes': ret_bboxes.detach().cpu().numpy(),
             'labels': ret_labels.detach().cpu().numpy(),
             'scores': ret_scores.detach().cpu().numpy()
         }
-        
-        # Add bbox heights to display on visualization
-        if bbox_heights is not None:
-            result['point_heights'] = bbox_heights
-        
         return result
 
 
-    def _calculate_point_heights(self, bboxes, points):
-        '''
-        Calculate height for each bbox using point cloud (min to max z-values).
-        Uses slightly expanded bbox to ensure we capture all relevant points.
-        
-        Args:
-            bboxes: (N, 7) [x, y, z, w, l, h, yaw]
-            points: (M, 4) [x, y, z, intensity] - original point cloud
-        Returns:
-            heights: (N,) numpy array of heights in meters
-        '''
-        if isinstance(points, np.ndarray):
-            points = torch.from_numpy(points).to(bboxes.device)
-        
-        heights = np.zeros(len(bboxes), dtype=np.float32)
-        
-        for i, bbox in enumerate(bboxes):
-            # Expand bbox significantly to capture all relevant points
-            expanded_bbox = bbox.clone()
-            expanded_bbox[3] *= 1.2  # width
-            expanded_bbox[4] *= 1.2  # length
-            expanded_bbox[5] *= 1.15  # height
-            
-            # Extract points within this expanded bounding box
-            points_in_bbox = self._get_points_in_bbox(points, expanded_bbox)
-            
-            # Debug: Print info for first few detections
-            if i < 3:
-                print(f"[HEIGHT DEBUG {i}] Bbox height: {bbox[5].item():.2f}m, Points found: {len(points_in_bbox)}")
-                if len(points_in_bbox) > 0:
-                    z_values = points_in_bbox[:, 2]
-                    print(f"[HEIGHT DEBUG {i}] Z range: {z_values.min().item():.2f} to {z_values.max().item():.2f}")
-            
-            if len(points_in_bbox) < 5:
-                # Too few points - use bbox height as fallback
-                heights[i] = bbox[5].item()
-                if i < 3:
-                    print(f"[HEIGHT DEBUG {i}] Using bbox height (too few points): {heights[i]:.2f}m")
-            else:
-                # Calculate height using actual min/max of z-values (ground to top)
-                z_values = points_in_bbox[:, 2]
-                z_min = z_values.min().item()
-                z_max = z_values.max().item()
-                heights[i] = z_max - z_min
-                if i < 3:
-                    print(f"[HEIGHT DEBUG {i}] Calculated height from points: {heights[i]:.2f}m")
-        
-        return heights
-
-    def _apply_post_filter(self, bboxes, labels, scores, points=None, bbox_heights=None):
-        '''
-        Post-processing filter to reject false positives for pedestrian class.
-        Uses height-based filtering using bbox predicted heights.
-        
-        Args:
-            bboxes: (N, 7) [x, y, z, w, l, h, yaw]
-            labels: (N,) class indices
-            scores: (N,) confidence scores
-            points: (M, 4) [x, y, z, intensity] or None - original point cloud (not used currently)
-            bbox_heights: (N,) numpy array of bbox heights or None
-        Returns:
-            filtered bboxes, labels, scores, bbox_heights
-        '''
-        # Class index for pedestrian (0 in KITTI: Pedestrian=0, Cyclist=1, Car=2)
-        PEDESTRIAN_CLASS = 0
-        
-        # Pedestrian height thresholds (meters)
-        MAX_PEDESTRIAN_HEIGHT = 2.0
-        MIN_PEDESTRIAN_HEIGHT = 1.0
-        
-        # Create mask for filtering
-        keep_mask = torch.ones(bboxes.size(0), dtype=torch.bool, device=bboxes.device)
-        
-        # Find pedestrian detections
-        ped_mask = labels == PEDESTRIAN_CLASS
-        
-        num_ped_before = ped_mask.sum().item()
-        
-        if num_ped_before == 0:
-            return bboxes, labels, scores, bbox_heights
-        
-        print(f"[POST-FILTER] Processing {num_ped_before} pedestrian detections")
-        
-        # Use bbox heights for filtering
-        if bbox_heights is None:
-            print("[POST-FILTER] WARNING: Heights not available, skipping filter")
-            return bboxes, labels, scores, bbox_heights
-        
-        ped_indices = torch.where(ped_mask)[0]
-        num_filtered = 0
-        
-        for idx in ped_indices:
-            idx_item = idx.item()
-            score = scores[idx].item()
-            height = bbox_heights[idx_item]
-            
-            # Reject if height is outside pedestrian range
-            if height > MAX_PEDESTRIAN_HEIGHT:
-                keep_mask[idx] = False
-                num_filtered += 1
-                print(f"[POST-FILTER] Ped {idx_item}: score={score:.3f}, height={height:.2f}m -> REJECTED (too tall)")
-            elif height < MIN_PEDESTRIAN_HEIGHT:
-                keep_mask[idx] = False
-                num_filtered += 1
-                print(f"[POST-FILTER] Ped {idx_item}: score={score:.3f}, height={height:.2f}m -> REJECTED (too short)")
-            else:
-                print(f"[POST-FILTER] Ped {idx_item}: score={score:.3f}, height={height:.2f}m -> Kept")
-        
-        print(f"[POST-FILTER] Filtered {num_filtered}/{num_ped_before} pedestrians (height-based)")
-        
-        # Apply filter
-        filtered_bboxes = bboxes[keep_mask]
-        filtered_labels = labels[keep_mask]
-        filtered_scores = scores[keep_mask]
-        
-        # Filter heights if available
-        filtered_heights = None
-        if bbox_heights is not None:
-            keep_mask_np = keep_mask.detach().cpu().numpy()
-            filtered_heights = bbox_heights[keep_mask_np]
-        
-        return filtered_bboxes, filtered_labels, filtered_scores, filtered_heights
-    
-    def _get_points_in_bbox(self, points, bbox):
-        '''
-        Extract points within a 3D bounding box.
-        
-        Args:
-            points: (M, 3 or 4) [x, y, z, (intensity)]
-            bbox: (7,) [x, y, z, w, l, h, yaw]
-        Returns:
-            points_in_bbox: (N, 3) [x, y, z]
-        '''
-        cx, cy, cz, w, l, h, yaw = bbox
-        
-        # Transform points to bbox-centered coordinate system
-        points_xyz = points[:, :3]
-        
-        # Translation
-        points_centered = points_xyz - torch.tensor([cx, cy, cz], device=points.device)
-        
-        # Rotation (inverse rotation to align with bbox)
-        cos_yaw = torch.cos(-yaw)
-        sin_yaw = torch.sin(-yaw)
-        rotation_matrix = torch.tensor([
-            [cos_yaw, -sin_yaw, 0],
-            [sin_yaw, cos_yaw, 0],
-            [0, 0, 1]
-        ], device=points.device)
-        
-        points_rotated = points_centered @ rotation_matrix.T
-        
-        # Check if points are within box bounds
-        in_x = torch.abs(points_rotated[:, 0]) <= w / 2
-        in_y = torch.abs(points_rotated[:, 1]) <= l / 2
-        in_z = torch.abs(points_rotated[:, 2]) <= h / 2
-        
-        in_bbox = in_x & in_y & in_z
-        
-        return points_xyz[in_bbox]
-
-    def get_predicted_bboxes(self, bbox_cls_pred, bbox_pred, bbox_dir_cls_pred, batched_anchors, batched_pts=None):
+    def get_predicted_bboxes(self, bbox_cls_pred, bbox_pred, bbox_dir_cls_pred, batched_anchors):
         '''
         bbox_cls_pred: (bs, n_anchors*3, 248, 216) 
         bbox_pred: (bs, n_anchors*7, 248, 216)
         bbox_dir_cls_pred: (bs, n_anchors*2, 248, 216)
         batched_anchors: (bs, y_l, x_l, 3, 2, 7)
-        batched_pts: list of (M_i, 4) point clouds or None - for post-filtering
         return: 
             bboxes: [(k1, 7), (k2, 7), ... ]
             labels: [(k1, ), (k2, ), ... ]
@@ -1628,12 +1308,10 @@ class PointPillars(nn.Module):
         results = []
         bs = bbox_cls_pred.size(0)
         for i in range(bs):
-            points = batched_pts[i] if batched_pts is not None else None
             result = self.get_predicted_bboxes_single(bbox_cls_pred=bbox_cls_pred[i],
                                                       bbox_pred=bbox_pred[i], 
                                                       bbox_dir_cls_pred=bbox_dir_cls_pred[i], 
-                                                      anchors=batched_anchors[i],
-                                                      points=points)
+                                                      anchors=batched_anchors[i])
             results.append(result)
         return results
 
@@ -1758,16 +1436,14 @@ class PointPillars(nn.Module):
             results = self.get_predicted_bboxes(bbox_cls_pred=bbox_cls_pred, 
                                                 bbox_pred=bbox_pred, 
                                                 bbox_dir_cls_pred=bbox_dir_cls_pred, 
-                                                batched_anchors=batched_anchors,
-                                                batched_pts=batched_pts)
+                                                batched_anchors=batched_anchors)
             return results
 
         elif mode == 'test':
             results = self.get_predicted_bboxes(bbox_cls_pred=bbox_cls_pred, 
                                                 bbox_pred=bbox_pred, 
                                                 bbox_dir_cls_pred=bbox_dir_cls_pred, 
-                                                batched_anchors=batched_anchors,
-                                                batched_pts=batched_pts)
+                                                batched_anchors=batched_anchors)
             return results
         else:
             raise ValueError   

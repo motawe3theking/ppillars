@@ -1,0 +1,17 @@
+ONNX Model Information
+================================================================================
+
+ONNX file: onnx_models\pointpillars_backbone_neck_head.onnx
+
+Inputs:
+  0. pillar_features: ['s73', 64, 432, 496] (tensor(float))
+
+Outputs:
+  0. cls_preds: ['s73', 18, 216, 248] (tensor(float))
+  1. box_preds: ['s73', 42, 216, 248] (tensor(float))
+  2. dir_preds: ['s73', 12, 216, 248] (tensor(float))
+
+Usage (Python with ONNX Runtime):
+  import onnxruntime as ort
+  session = ort.InferenceSession('onnx_models\pointpillars_backbone_neck_head.onnx')
+  outputs = session.run(None, {'pillar_features': input_data})

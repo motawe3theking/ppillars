@@ -94,20 +94,7 @@ def points_camera2lidar(points, tr_velo_to_cam, r0_rect):
 
 
 def bbox3d2bevcorners(bboxes):
-    '''
-    bboxes: shape=(n, 7)
 
-                ^ x (-0.5 * pi)
-                |
-                |                (bird's eye view)
-       (-pi)  o |
-        y <-------------- (0)
-                 \ / (ag)
-                  \ 
-                   \ 
-
-    return: shape=(n, 4, 2)
-    '''
     centers, dims, angles = bboxes[:, :2], bboxes[:, 3:5], bboxes[:, 6]
 
     # 1.generate bbox corner coordinates, clockwise from minimal point
