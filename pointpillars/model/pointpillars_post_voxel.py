@@ -23,8 +23,8 @@ class PointPillarsPostVoxel(nn.Module):
     elif NARROW_RANGE == 'mid':
         point_cloud_range = [0, -20.48, -3, 40.96, 20.48, 1]
     elif NARROW_RANGE == 'wide':
-        # point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1]
-        point_cloud_range = [0, -40.32, -3, 70.2, 40.32, 1]
+        point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1]
+        # point_cloud_range = [0, -40.32, -3, 70.2, 40.32, 1]
 
     def __init__(self, nclasses: int = 3, in_channels: int = PILLAR_FEATURES):
         super().__init__()

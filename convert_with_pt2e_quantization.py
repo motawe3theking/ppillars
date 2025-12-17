@@ -89,7 +89,7 @@ def run_calibration(prepared_model, calib_loader, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--calib-dir', default="calib_features", help='Directory with .npy pillar feature maps')
+    parser.add_argument('--calib-dir', default="/mnt/c/Users/AIT/Desktop/GIU/Bachelor/manual_repo_migrate/PointPillars/calib_features/train", help='Directory with .npy pillar feature maps')
     parser.add_argument('--ckpt', default="/mnt/c/Users/AIT/Desktop/GIU/Bachelor/manual_repo_migrate/PointPillars/mobilenet_Ratio_0.16m_64f_Upsample/checkpoints/checkpoint_epoch_104.pth", help='Path to checkpoint to load weights from (optional)')
     parser.add_argument('--output', default='quantized_post_voxel.pt', help='Output quantized model path')
     parser.add_argument('--device', default='cpu', help='Device for calibration and conversion')
